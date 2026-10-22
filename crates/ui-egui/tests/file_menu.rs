@@ -450,6 +450,11 @@ fn an_asynchronous_save_goes_to_the_workbook_that_asked() {
     h.state_mut().run("file.new", serde_json::json!({})).unwrap();
     let other = uid(&h);
     assert_ne!(asker, other);
+    // The workbook made meanwhile is editing a text box when the answer comes.
+    let shape = h.state_mut().run("insert.textBox", serde_json::json!({"at": "B2", "width": 200, "height": 80, "text": "note"})).unwrap()["shape"]
+        .as_u64()
+        .unwrap() as u32;
+    assert!(h.state_mut().begin_text_box_edit(shape));
     let target = dir.join("Asker.xlsx");
     answer.send(Some(target.to_string_lossy().into_owned())).unwrap();
     h.run_steps(2);

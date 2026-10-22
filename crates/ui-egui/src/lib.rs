@@ -642,6 +642,12 @@ impl SheetApp {
             self.message = Some(("GridCraft".into(), "The workbook was closed before a file was chosen, so nothing was saved.".into()));
             return;
         };
+        // A text-box draft belongs to the active workbook: commit it before the switch, as
+        // window.activate does, or the save refuses it as off-sheet.
+        if let Err(e) = self.commit_text_box_edit() {
+            self.alert(e);
+            return;
+        }
         self.session.set_active(asked);
         self.after_pick(then, path);
         if let Some(i) = self.session.documents().iter().position(|d| Some(d.uid) == active) {
