@@ -853,7 +853,10 @@ fn resolve_target(source_dir: &str, target: &str) -> String {
 type Zip<'a> = zip::ZipArchive<Cursor<&'a [u8]>>;
 
 fn zip_names(zip: &mut Zip<'_>) -> Vec<String> {
-    (0..zip.len().min(MAX_ENTRIES)).filter_map(|i| zip.by_index_raw(i).ok().filter(|f| !f.is_dir()).map(|f| f.name().to_string())).collect()
+    // Raw names, so an entry whose name doesn't decode is still listed and reported.
+    (0..zip.len().min(MAX_ENTRIES))
+        .filter_map(|i| zip.by_index_raw(i).ok().filter(|f| !f.is_dir()).map(|f| String::from_utf8_lossy(f.name_raw()).into_owned()))
+        .collect()
 }
 
 fn read_zip_part(zip: &mut Zip<'_>, name: &str) -> Result<Vec<u8>, String> {
@@ -1591,7 +1594,7 @@ mod tests {
         let mut pending: Vec<(&str, &str)> = rels.to_vec();
         for i in 0..src.len() {
             let mut f = src.by_index(i).unwrap();
-            let name = f.name().to_string();
+            let name = f.name().unwrap().to_string();
             let mut body = String::new();
             f.read_to_string(&mut body).unwrap();
             if let Some(at) = pending.iter().position(|(r, _)| *r == name) {
