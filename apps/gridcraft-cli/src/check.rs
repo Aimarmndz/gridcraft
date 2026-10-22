@@ -853,14 +853,28 @@ fn resolve_target(source_dir: &str, target: &str) -> String {
 type Zip<'a> = zip::ZipArchive<Cursor<&'a [u8]>>;
 
 fn zip_names(zip: &mut Zip<'_>) -> Vec<String> {
-    // Raw names, so an entry whose name doesn't decode is still listed and reported.
-    (0..zip.len().min(MAX_ENTRIES))
-        .filter_map(|i| zip.by_index_raw(i).ok().filter(|f| !f.is_dir()).map(|f| String::from_utf8_lossy(f.name_raw()).into_owned()))
-        .collect()
+    (0..zip.len().min(MAX_ENTRIES)).filter_map(|i| zip.by_index_raw(i).ok().filter(|f| !f.is_dir()).map(|f| entry_name(&f))).collect()
+}
+
+/// An entry's name decoded (UTF-8, or CP437 when not flagged UTF-8), or its raw bytes made lossy
+/// when they don't decode, so such an entry is still listed and reported.
+fn entry_name<R: std::io::Read>(f: &zip::read::ZipFile<'_, R>) -> String {
+    f.name().map(|n| n.into_owned()).unwrap_or_else(|_| String::from_utf8_lossy(f.name_raw()).into_owned())
+}
+
+/// The entry [`zip_names`] lists as `name`. zip 9 looks names up by their raw bytes, which a
+/// decoded CP437 name doesn't match, so those are found by listing.
+fn zip_entry<'z, 'b>(zip: &'z mut Zip<'b>, name: &str) -> zip::result::ZipResult<zip::read::ZipFile<'z, Cursor<&'b [u8]>>> {
+    let named = |zip: &mut Zip<'_>, i: usize| zip.by_index_raw(i).is_ok_and(|f| entry_name(&f) == name);
+    let index = match zip.index_for_name(name) {
+        Some(i) if named(zip, i) => i,
+        _ => (0..zip.len().min(MAX_ENTRIES)).find(|&i| named(zip, i)).ok_or(zip::result::ZipError::FileNotFound)?,
+    };
+    zip.by_index(index)
 }
 
 fn read_zip_part(zip: &mut Zip<'_>, name: &str) -> Result<Vec<u8>, String> {
-    let f = zip.by_name(name).map_err(|e| format!("{name}: {e}"))?;
+    let f = zip_entry(zip, name).map_err(|e| format!("{name}: {e}"))?;
     let mut buf = Vec::new();
     f.take(MAX_XML_PART).read_to_end(&mut buf).map_err(|e| format!("{name}: {e}"))?;
     Ok(buf)
@@ -1018,7 +1032,7 @@ fn rels_source_dir(key: &str) -> Option<String> {
 /// comes first) a comment, for VML a shape. Read only as far as needed; an unreadable part counts.
 fn holds_something(zip: &mut Zip<'_>, name: &str, kind: &str) -> bool {
     use quick_xml::events::Event;
-    let Ok(f) = zip.by_name(name) else { return true };
+    let Ok(f) = zip_entry(zip, name) else { return true };
     let mut reader = quick_xml::Reader::from_reader(std::io::BufReader::new(f.take(MAX_XML_PART)));
     let wanted: Option<&[u8]> = match kind.to_ascii_lowercase().as_str() {
         "comments" => Some(b"comment"),
@@ -1579,6 +1593,30 @@ mod tests {
         assert!(validate_package(b"not a zip").is_err());
         let own = gridcraft_engine::io::save_bytes(&book(&[("A1", "=1", n(1.0))]), "t.xlsx").unwrap();
         assert_eq!(validate_package(&own).unwrap(), Vec::<String>::new());
+    }
+
+    /// zip 9 looks entries up by raw name bytes; a CP437 name (not flagged UTF-8) is listed
+    /// decoded and must still be readable under that name.
+    #[test]
+    fn package_validation_reads_parts_with_cp437_names() {
+        let mut z = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let stored = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for (name, body) in [
+            ("[Content_Types].xml", r#"<Types><Default Extension="rels" ContentType="r"/><Override PartName="/xl/éé.xml" ContentType="x"/></Types>"#),
+            ("xl/QQ.xml", "<x/>"),
+            ("xl/_rels/QQ.xml.rels", r#"<Relationships><Relationship Id="rId1" Type="x/styles" Target="styles.xml"/></Relationships>"#),
+        ] {
+            z.start_file(name, stored).unwrap();
+            z.write_all(body.as_bytes()).unwrap();
+        }
+        let mut bytes = z.finish().unwrap().into_inner();
+        // 0x82 is `é` in CP437 and not valid UTF-8 on its own.
+        for i in 0..bytes.len() - 1 {
+            if &bytes[i..i + 2] == b"QQ" {
+                bytes[i..i + 2].copy_from_slice(&[0x82, 0x82]);
+            }
+        }
+        assert_eq!(validate_package(&bytes).unwrap(), ["xl/_rels/éé.xml.rels: rId1 (styles) targets missing part xl/styles.xml"]);
     }
 
     const WB_RELS: &str = "xl/_rels/workbook.xml.rels";
