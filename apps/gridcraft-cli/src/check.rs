@@ -911,9 +911,10 @@ fn full_calc_on_load(bytes: &[u8]) -> bool {
         .any(|(e, a)| e == "calcPr" && attr(&a, "fullCalcOnLoad").is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true")))
 }
 
-/// Problems Excel would repair in a written package: parts without a content type, content-type
-/// overrides for missing parts, relationship files for missing parts, duplicate relationship ids
-/// and internal relationships pointing at missing parts. `Err` when the package can't be read.
+/// Problems Excel would repair in a written package: parts listed twice, parts without a content
+/// type, content-type overrides for missing parts, relationship files for missing parts, duplicate
+/// relationship ids and internal relationships pointing at missing parts. `Err` when the package
+/// can't be read.
 pub fn validate_package(bytes: &[u8]) -> Result<Vec<String>, String> {
     let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| format!("not a zip package: {e}"))?;
     let (names, index) = zip_names(&mut zip);
@@ -944,6 +945,11 @@ pub fn validate_package(bytes: &[u8]) -> Result<Vec<String>, String> {
     }
     let mut sorted: Vec<&String> = names.iter().collect();
     sorted.sort();
+    // Two entries can decode to one name (one CP437, one UTF-8); only the first would be read.
+    let repeated: BTreeSet<&String> = sorted.windows(2).filter_map(|w| (w[0] == w[1]).then_some(w[0])).collect();
+    for n in repeated {
+        issues.push(format!("part {n} is in the package more than once"));
+    }
     for n in &sorted {
         let key = part_key(n);
         if key == "[content_types].xml" {
@@ -1622,6 +1628,29 @@ mod tests {
             }
         }
         assert_eq!(validate_package(&bytes).unwrap(), ["xl/_rels/éé.xml.rels: rId1 (styles) targets missing part xl/styles.xml"]);
+    }
+
+    /// A CP437 name and a UTF-8 name can decode to the same part name; the checker reads one entry
+    /// per name, so it reports the repeat instead of checking the first entry twice.
+    #[test]
+    fn package_validation_reports_a_part_name_used_twice() {
+        let mut z = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let stored = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for (name, body) in [
+            ("[Content_Types].xml", r#"<Types><Override PartName="/xl/éé.xml" ContentType="x"/></Types>"#),
+            ("xl/éé.xml", "<x/>"),
+            ("xl/QQ.xml", "<y/>"),
+        ] {
+            z.start_file(name, stored).unwrap();
+            z.write_all(body.as_bytes()).unwrap();
+        }
+        let mut bytes = z.finish().unwrap().into_inner();
+        for i in 0..bytes.len() - 1 {
+            if &bytes[i..i + 2] == b"QQ" {
+                bytes[i..i + 2].copy_from_slice(&[0x82, 0x82]);
+            }
+        }
+        assert_eq!(validate_package(&bytes).unwrap(), ["part xl/éé.xml is in the package more than once"]);
     }
 
     const WB_RELS: &str = "xl/_rels/workbook.xml.rels";
