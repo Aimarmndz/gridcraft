@@ -323,8 +323,9 @@ pub struct SheetApp {
     /// Every unsaved workbook has been answered for quitting (or `app.quit` asked): the next
     /// window close goes through.
     pub allow_close: bool,
-    /// An asynchronous picker still open, and what its answer is for.
-    pending_pick: Option<(AfterPick, std::sync::mpsc::Receiver<Option<String>>)>,
+    /// An asynchronous picker still open: what its answer is for, the workbook that asked (by uid)
+    /// and where the answer comes.
+    pending_pick: Option<(AfterPick, Option<u64>, std::sync::mpsc::Receiver<Option<String>>)>,
 }
 
 impl SheetApp {
@@ -602,7 +603,7 @@ impl SheetApp {
         if let Some(start) = &self.services.pick_async {
             let (answer, rx) = std::sync::mpsc::channel();
             start(pick, answer);
-            self.pending_pick = Some((then, rx));
+            self.pending_pick = Some((then, self.session.active().map(|d| d.uid), rx));
             return None;
         }
         let path = match &pick {
@@ -614,17 +615,37 @@ impl SheetApp {
 
     /// Hands the asynchronous picker's answer to what asked for it, once it has arrived.
     fn poll_pick(&mut self, ctx: &egui::Context) {
-        let Some((_, rx)) = &self.pending_pick else { return };
+        let Some((_, _, rx)) = &self.pending_pick else { return };
         match rx.try_recv() {
             Ok(path) => {
-                if let Some((then, _)) = self.pending_pick.take() {
-                    self.after_pick(then, path);
+                if let Some((then, uid, _)) = self.pending_pick.take() {
+                    self.after_pick_for(uid, then, path);
                 }
             }
             // The host gave up on the picker without answering: nothing to do.
             Err(std::sync::mpsc::TryRecvError::Disconnected) => self.pending_pick = None,
             // Nothing wakes the frame loop when the answer comes, so keep looking for it.
             Err(std::sync::mpsc::TryRecvError::Empty) => ctx.request_repaint_after(std::time::Duration::from_millis(100)),
+        }
+    }
+
+    /// [`Self::after_pick`] for the workbook that asked: the frame loop kept running while the
+    /// picker was up, so another workbook may be active now (the control channel can switch or
+    /// close one). Saves and exports go to the one that asked, and the active one stays active.
+    fn after_pick_for(&mut self, uid: Option<u64>, then: AfterPick, path: Option<String>) {
+        let active = self.session.active().map(|d| d.uid);
+        if matches!(then, AfterPick::Open) || path.is_none() || active == uid {
+            self.after_pick(then, path);
+            return;
+        }
+        let Some(asked) = self.session.documents().iter().position(|d| Some(d.uid) == uid) else {
+            self.message = Some(("GridCraft".into(), "The workbook was closed before a file was chosen, so nothing was saved.".into()));
+            return;
+        };
+        self.session.set_active(asked);
+        self.after_pick(then, path);
+        if let Some(i) = self.session.documents().iter().position(|d| Some(d.uid) == active) {
+            self.session.set_active(i);
         }
     }
 
